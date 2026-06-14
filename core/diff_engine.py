@@ -241,15 +241,65 @@ class DiffEngine:
         for norm_name in all_idx_names:
             src_i = src_idx.get(norm_name)
             tgt_i = tgt_idx.get(norm_name)
+
+            if src_i and src_i.is_primary:
+                continue
+            if tgt_i and tgt_i.is_primary:
+                if not (src_i and src_i.is_primary):
+                    if self.config.should_drop_missing_indexes():
+                        self.logger.debug(
+                            f'跳过主键索引(由pk_changed处理): {source.name}.{tgt_i.name}',
+                            step='DIFF_COMPARE'
+                        )
+                    continue
+
             if src_i and not tgt_i:
-                self.logger.debug(f'新增索引: {source.name}.{src_i.name}', step='DIFF_COMPARE')
-                table_diff.index_diffs.append(IndexDiff(
-                    diff_type=DiffType.INDEX_ADD,
-                    table_name=source.name,
-                    index_name=src_i.name,
-                    source_index=src_i,
-                ))
+                src_cols_key = tuple(sorted([self._normalize_name(c) for c in src_i.columns]))
+                found_same_content = False
+                for t_norm, t_existing in tgt_idx.items():
+                    if t_existing.is_primary:
+                        continue
+                    t_cols_key = tuple(sorted([self._normalize_name(c) for c in t_existing.columns]))
+                    if t_cols_key == src_cols_key and t_existing.is_unique == src_i.is_unique:
+                        found_same_content = True
+                        self.logger.debug(
+                            f'索引重命名检测: 源[{src_i.name}] 目标[{t_existing.name}], '
+                            f'列和唯一性一致,判定为修改',
+                            step='DIFF_COMPARE'
+                        )
+                        idx_diff = self._compare_index(source.name, src_i, t_existing)
+                        if idx_diff is None:
+                            idx_diff = IndexDiff(
+                                diff_type=DiffType.INDEX_MODIFY,
+                                table_name=source.name,
+                                index_name=src_i.name,
+                                source_index=src_i,
+                                target_index=t_existing,
+                                changed_fields=['name'],
+                            )
+                        table_diff.index_diffs.append(idx_diff)
+                        del tgt_idx[t_norm]
+                        break
+                if not found_same_content:
+                    self.logger.debug(f'新增索引: {source.name}.{src_i.name}', step='DIFF_COMPARE')
+                    table_diff.index_diffs.append(IndexDiff(
+                        diff_type=DiffType.INDEX_ADD,
+                        table_name=source.name,
+                        index_name=src_i.name,
+                        source_index=src_i,
+                    ))
             elif tgt_i and not src_i:
+                tgt_cols_key = tuple(sorted([self._normalize_name(c) for c in tgt_i.columns]))
+                matched_by_content = False
+                for s_norm, s_existing in src_idx.items():
+                    if s_existing.is_primary:
+                        continue
+                    s_cols_key = tuple(sorted([self._normalize_name(c) for c in s_existing.columns]))
+                    if s_cols_key == tgt_cols_key and s_existing.is_unique == tgt_i.is_unique:
+                        matched_by_content = True
+                        break
+                if matched_by_content:
+                    continue
                 if self.config.should_drop_missing_indexes():
                     self.logger.debug(f'删除索引: {source.name}.{tgt_i.name}', step='DIFF_COMPARE')
                     table_diff.index_diffs.append(IndexDiff(
@@ -258,6 +308,11 @@ class DiffEngine:
                         index_name=tgt_i.name,
                         target_index=tgt_i,
                     ))
+                else:
+                    self.logger.debug(
+                        f'跳过删除索引(配置禁用): {source.name}.{tgt_i.name}',
+                        step='DIFF_COMPARE'
+                    )
             else:
                 idx_diff = self._compare_index(source.name, src_i, tgt_i)
                 if idx_diff:
@@ -318,9 +373,27 @@ class DiffEngine:
         tgt_cols = [self._normalize_name(c) for c in target.columns]
         if src_cols != tgt_cols:
             changed_fields.append('columns')
+        else:
+            for i, sc in enumerate(source.columns):
+                if not self._match_name(sc, target.columns[i]):
+                    changed_fields.append('columns')
+                    break
 
         if source.is_unique != target.is_unique:
             changed_fields.append('is_unique')
+
+        if source.is_primary != target.is_primary:
+            changed_fields.append('is_primary')
+
+        src_idx_type = (source.index_type or '').lower()
+        tgt_idx_type = (target.index_type or '').lower()
+        if src_idx_type and tgt_idx_type and src_idx_type != tgt_idx_type:
+            compatible_types = {
+                ('btree', ''), ('', 'btree'),
+                ('btree', 'b-tree'), ('b-tree', 'btree'),
+            }
+            if (src_idx_type, tgt_idx_type) not in compatible_types:
+                changed_fields.append('index_type')
 
         if changed_fields:
             self.logger.debug(
