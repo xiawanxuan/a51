@@ -1,0 +1,64 @@
+sync:
+  source_conn: mysql_source
+  target_conn: pgsql_target
+  mode: preview
+  auto_rollback: true
+  output_dir: output
+
+table_filter:
+  mode: whitelist
+  whitelist:
+    - users
+    - orders
+    - products
+  blacklist:
+    - temp_%
+    - backup_%
+
+column_filter:
+  ignore_columns:
+    - created_at
+    - updated_at
+    - deleted_at
+
+index_filter:
+  ignore_indexes:
+    - idx_temp_%
+
+rules:
+  drop_missing_tables: false
+  drop_missing_columns: false
+  drop_missing_indexes: false
+  modify_column_type: true
+  case_sensitive: false
+  type_mapping:
+    mysql:
+      varchar: varchar
+      int: integer
+      bigint: bigint
+      tinyint: smallint
+      datetime: timestamp
+      text: text
+      decimal: numeric
+      double: double precision
+      float: real
+      boolean: boolean
+      blob: bytea
+      json: jsonb
+    postgresql:
+      varchar: varchar
+      integer: int
+      bigint: bigint
+      smallint: tinyint
+      timestamp: datetime
+      text: text
+      numeric: decimal
+      double precision: double
+      real: float
+      boolean: boolean
+      bytea: blob
+      jsonb: json
+
+schedule:
+  enabled: false
+  cron: "0 2 * * *"
