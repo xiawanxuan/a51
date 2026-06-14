@@ -59,6 +59,13 @@ rules:
       bytea: blob
       jsonb: json
 
+dependency_check:
+  enabled: true
+  blocking: true
+  check_foreign_keys: true
+  check_partitions: true
+  check_triggers: true
+
 schedule:
   enabled: false
   cron: "0 2 * * *"

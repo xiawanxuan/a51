@@ -9,6 +9,7 @@ from core.logger import SyncLogger
 from core.db_adapter import DBAdapter
 from core.metadata_collector import MetadataCollector
 from core.diff_engine import DiffEngine
+from core.dependency_checker import DependencyChecker
 from core.ddl_executor import DDLExecutor
 
 
@@ -71,6 +72,24 @@ class DBSyncRunner:
         engine = DiffEngine(self.config, self.logger)
         return engine.compare(source_schema, target_schema)
 
+    def _check_dependencies(self, source_schema, target_schema, schema_diff) -> bool:
+        checker = DependencyChecker(self.config, self.logger)
+        result = checker.run(source_schema, target_schema, schema_diff)
+        if not result.passed and self.config.is_dependency_check_blocking():
+            self.logger.error(
+                f'依赖校验未通过（错误{len(result.errors)}个，警告{len(result.warnings)}个），'
+                f'同步任务已终止。可设置 dependency_check.blocking=false 继续执行，'
+                f'或修复问题后重试。',
+                step='MAIN'
+            )
+            return False
+        if result.warnings:
+            self.logger.warning(
+                f'依赖校验存在警告（{len(result.warnings)}个），请仔细评估风险后继续',
+                step='MAIN'
+            )
+        return True
+
     def _generate_and_execute(self, schema_diff, source_db_type):
         executor = DDLExecutor(self.target_db, self.config, self.logger)
         script = executor.generate_script(schema_diff, source_db_type)
@@ -91,7 +110,11 @@ class DBSyncRunner:
             self._connect_databases()
             source_schema, target_schema = self._collect_metadata()
             schema_diff = self._compare_diff(source_schema, target_schema)
-            success, _ = self._generate_and_execute(schema_diff, source_schema.db_type)
+            if not self._check_dependencies(source_schema, target_schema, schema_diff):
+                self.logger.error('========== 依赖校验未通过，同步任务中止 ==========', step='MAIN')
+                success = False
+            else:
+                success, _ = self._generate_and_execute(schema_diff, source_schema.db_type)
 
             if success:
                 self.logger.info('========== 数据库结构同步任务完成 ==========', step='MAIN')

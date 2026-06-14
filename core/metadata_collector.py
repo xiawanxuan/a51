@@ -56,20 +56,88 @@ class IndexInfo:
 
 
 @dataclass
+class ForeignKeyInfo:
+    name: str
+    columns: List[str] = field(default_factory=list)
+    ref_table: str = ''
+    ref_columns: List[str] = field(default_factory=list)
+    on_delete: str = ''
+    on_update: str = ''
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'name': self.name,
+            'columns': self.columns,
+            'ref_table': self.ref_table,
+            'ref_columns': self.ref_columns,
+            'on_delete': self.on_delete,
+            'on_update': self.on_update,
+        }
+
+
+@dataclass
+class PartitionInfo:
+    name: str
+    partition_type: str = ''
+    partition_expression: str = ''
+    parent_table: str = ''
+    partition_values: str = ''
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'name': self.name,
+            'partition_type': self.partition_type,
+            'partition_expression': self.partition_expression,
+            'parent_table': self.parent_table,
+            'partition_values': self.partition_values,
+        }
+
+
+@dataclass
+class TriggerInfo:
+    name: str
+    event_manipulation: str = ''
+    action_timing: str = ''
+    action_statement: str = ''
+    action_orientation: str = ''
+    referenced_trigger: str = ''
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'name': self.name,
+            'event_manipulation': self.event_manipulation,
+            'action_timing': self.action_timing,
+            'action_statement': self.action_statement,
+            'action_orientation': self.action_orientation,
+            'referenced_trigger': self.referenced_trigger,
+        }
+
+
+@dataclass
 class TableInfo:
     name: str
     columns: Dict[str, ColumnInfo] = field(default_factory=dict)
     indexes: Dict[str, IndexInfo] = field(default_factory=dict)
+    foreign_keys: Dict[str, ForeignKeyInfo] = field(default_factory=dict)
+    partitions: List[PartitionInfo] = field(default_factory=list)
+    triggers: Dict[str, TriggerInfo] = field(default_factory=dict)
     primary_key_columns: List[str] = field(default_factory=list)
     comment: str = ''
+    is_partitioned: bool = False
+    parent_table: str = ''
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             'name': self.name,
             'columns': {k: v.to_dict() for k, v in self.columns.items()},
             'indexes': {k: v.to_dict() for k, v in self.indexes.items()},
+            'foreign_keys': {k: v.to_dict() for k, v in self.foreign_keys.items()},
+            'partitions': [p.to_dict() for p in self.partitions],
+            'triggers': {k: v.to_dict() for k, v in self.triggers.items()},
             'primary_key_columns': self.primary_key_columns,
             'comment': self.comment,
+            'is_partitioned': self.is_partitioned,
+            'parent_table': self.parent_table,
         }
 
 
@@ -77,11 +145,17 @@ class TableInfo:
 class SchemaInfo:
     db_type: str
     tables: Dict[str, TableInfo] = field(default_factory=dict)
+    all_foreign_keys: Dict[str, ForeignKeyInfo] = field(default_factory=dict)
+    all_triggers: Dict[str, TriggerInfo] = field(default_factory=dict)
+    partition_tables: Dict[str, List[str]] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             'db_type': self.db_type,
             'tables': {k: v.to_dict() for k, v in self.tables.items()},
+            'all_foreign_keys': {k: v.to_dict() for k, v in self.all_foreign_keys.items()},
+            'all_triggers': {k: v.to_dict() for k, v in self.all_triggers.items()},
+            'partition_tables': self.partition_tables,
         }
 
 
@@ -107,11 +181,22 @@ class MySQLMetadataCollector:
                 table_info = TableInfo(name=table_name)
                 table_info.columns = self._collect_columns(table_name)
                 table_info.indexes = self._collect_indexes(table_name)
+                table_info.foreign_keys = self._collect_foreign_keys(table_name)
+                table_info.partitions = self._collect_partitions(table_name)
+                table_info.triggers = self._collect_triggers(table_name)
                 table_info.primary_key_columns = self._get_primary_key_columns(table_info)
                 table_info.comment = self._collect_table_comment(table_name)
+                if table_info.partitions:
+                    table_info.is_partitioned = True
                 schema.tables[table_name] = table_info
+                for fk_name, fk in table_info.foreign_keys.items():
+                    schema.all_foreign_keys[f'{table_name}.{fk_name}'] = fk
+                for tr_name, tr in table_info.triggers.items():
+                    schema.all_triggers[f'{table_name}.{tr_name}'] = tr
                 self.logger.info(
-                    f'表 {table_name}: {len(table_info.columns)} 字段, {len(table_info.indexes)} 索引',
+                    f'表 {table_name}: {len(table_info.columns)} 字段, {len(table_info.indexes)} 索引, '
+                    f'{len(table_info.foreign_keys)} 外键, {len(table_info.partitions)} 分区, '
+                    f'{len(table_info.triggers)} 触发器',
                     step=f'MYSQL_COLLECT_TABLE_{table_name}'
                 )
                 self.logger.step_success(f'MYSQL_COLLECT_TABLE_{table_name}')
@@ -119,7 +204,15 @@ class MySQLMetadataCollector:
                 self.logger.step_failed(f'MYSQL_COLLECT_TABLE_{table_name}', e)
                 raise
 
+        self._build_partition_tree(schema)
         return schema
+
+    def _build_partition_tree(self, schema: SchemaInfo):
+        for tbl in schema.tables.values():
+            if tbl.is_partitioned:
+                children = [p.name for p in tbl.partitions if p.name]
+                if children:
+                    schema.partition_tables[tbl.name] = children
 
     def _collect_tables(self) -> List[str]:
         sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' ORDER BY table_name"
@@ -196,6 +289,83 @@ class MySQLMetadataCollector:
         row = self.db.execute(sql, (table_name,), fetch_one=True)
         return row[0] if row else ''
 
+    def _collect_foreign_keys(self, table_name: str) -> Dict[str, ForeignKeyInfo]:
+        sql = """
+            SELECT kc.constraint_name, kc.column_name,
+                   kc.referenced_table_name, kc.referenced_column_name,
+                   rc.update_rule, rc.delete_rule, kc.ordinal_position
+            FROM information_schema.key_column_usage kc
+            JOIN information_schema.referential_constraints rc
+              ON kc.constraint_name = rc.constraint_name
+             AND kc.table_schema = rc.constraint_schema
+            WHERE kc.table_schema = DATABASE()
+              AND kc.table_name = %s
+              AND kc.referenced_table_name IS NOT NULL
+            ORDER BY kc.constraint_name, kc.ordinal_position
+        """
+        rows = self.db.execute(sql, (table_name,), fetch=True)
+        fks: Dict[str, ForeignKeyInfo] = {}
+        for r in rows:
+            fk_name = r[0]
+            col_name = r[1]
+            ref_table = r[2]
+            ref_col = r[3]
+            on_update = r[4] or ''
+            on_delete = r[5] or ''
+            if fk_name not in fks:
+                fks[fk_name] = ForeignKeyInfo(
+                    name=fk_name,
+                    columns=[],
+                    ref_table=ref_table,
+                    ref_columns=[],
+                    on_update=on_update,
+                    on_delete=on_delete,
+                )
+            fks[fk_name].columns.append(col_name)
+            fks[fk_name].ref_columns.append(ref_col)
+        return fks
+
+    def _collect_partitions(self, table_name: str) -> List[PartitionInfo]:
+        sql = """
+            SELECT partition_name, partition_method, partition_expression,
+                   partition_description
+            FROM information_schema.partitions
+            WHERE table_schema = DATABASE() AND table_name = %s
+              AND partition_name IS NOT NULL
+            ORDER BY partition_ordinal_position
+        """
+        rows = self.db.execute(sql, (table_name,), fetch=True)
+        partitions = []
+        for r in rows:
+            partitions.append(PartitionInfo(
+                name=r[0] or '',
+                partition_type=r[1] or '',
+                partition_expression=r[2] or '',
+                parent_table=table_name,
+                partition_values=r[3] or '',
+            ))
+        return partitions
+
+    def _collect_triggers(self, table_name: str) -> Dict[str, TriggerInfo]:
+        sql = """
+            SELECT trigger_name, event_manipulation, action_timing,
+                   action_statement, action_orientation
+            FROM information_schema.triggers
+            WHERE trigger_schema = DATABASE() AND event_object_table = %s
+            ORDER BY trigger_name
+        """
+        rows = self.db.execute(sql, (table_name,), fetch=True)
+        triggers = {}
+        for r in rows:
+            triggers[r[0]] = TriggerInfo(
+                name=r[0],
+                event_manipulation=r[1] or '',
+                action_timing=r[2] or '',
+                action_statement=r[3] or '',
+                action_orientation=r[4] or '',
+            )
+        return triggers
+
 
 class PostgreSQLMetadataCollector:
     def __init__(self, db: DBConnection, config: ConfigManager, logger: SyncLogger):
@@ -220,11 +390,22 @@ class PostgreSQLMetadataCollector:
                 table_info = TableInfo(name=table_name)
                 table_info.columns = self._collect_columns(table_name)
                 table_info.indexes = self._collect_indexes(table_name)
+                table_info.foreign_keys = self._collect_foreign_keys(table_name)
+                table_info.partitions = self._collect_partitions(table_name)
+                table_info.triggers = self._collect_triggers(table_name)
                 table_info.primary_key_columns = self._get_primary_key_columns(table_info)
                 table_info.comment = self._collect_table_comment(table_name)
+                if table_info.partitions:
+                    table_info.is_partitioned = True
                 schema.tables[table_name] = table_info
+                for fk_name, fk in table_info.foreign_keys.items():
+                    schema.all_foreign_keys[f'{table_name}.{fk_name}'] = fk
+                for tr_name, tr in table_info.triggers.items():
+                    schema.all_triggers[f'{table_name}.{tr_name}'] = tr
                 self.logger.info(
-                    f'表 {table_name}: {len(table_info.columns)} 字段, {len(table_info.indexes)} 索引',
+                    f'表 {table_name}: {len(table_info.columns)} 字段, {len(table_info.indexes)} 索引, '
+                    f'{len(table_info.foreign_keys)} 外键, {len(table_info.partitions)} 分区, '
+                    f'{len(table_info.triggers)} 触发器',
                     step=f'PGSQL_COLLECT_TABLE_{table_name}'
                 )
                 self.logger.step_success(f'PGSQL_COLLECT_TABLE_{table_name}')
@@ -232,7 +413,15 @@ class PostgreSQLMetadataCollector:
                 self.logger.step_failed(f'PGSQL_COLLECT_TABLE_{table_name}', e)
                 raise
 
+        self._build_partition_tree(schema)
         return schema
+
+    def _build_partition_tree(self, schema: SchemaInfo):
+        for tbl in schema.tables.values():
+            if tbl.is_partitioned:
+                children = [p.name for p in tbl.partitions if p.name]
+                if children:
+                    schema.partition_tables[tbl.name] = children
 
     def _collect_tables(self) -> List[str]:
         sql = """
@@ -335,6 +524,101 @@ class PostgreSQLMetadataCollector:
         """
         row = self.db.execute(sql, (self.schema, table_name), fetch_one=True)
         return row[0] if row and row[0] else ''
+
+    def _collect_foreign_keys(self, table_name: str) -> Dict[str, ForeignKeyInfo]:
+        sql = """
+            SELECT tc.constraint_name, kcu.column_name,
+                   ccu.table_name AS referenced_table_name,
+                   ccu.column_name AS referenced_column_name,
+                   rc.update_rule, rc.delete_rule,
+                   kcu.ordinal_position
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+             AND tc.table_schema = kcu.table_schema
+            JOIN information_schema.constraint_column_usage ccu
+              ON ccu.constraint_name = tc.constraint_name
+             AND ccu.table_schema = tc.table_schema
+            JOIN information_schema.referential_constraints rc
+              ON tc.constraint_name = rc.constraint_name
+             AND tc.table_schema = rc.constraint_schema
+            WHERE tc.table_schema = %s
+              AND tc.table_name = %s
+              AND tc.constraint_type = 'FOREIGN KEY'
+            ORDER BY tc.constraint_name, kcu.ordinal_position
+        """
+        rows = self.db.execute(sql, (self.schema, table_name), fetch=True)
+        fks: Dict[str, ForeignKeyInfo] = {}
+        for r in rows:
+            fk_name = r[0]
+            col_name = r[1]
+            ref_table = r[2]
+            ref_col = r[3]
+            on_update = r[4] or ''
+            on_delete = r[5] or ''
+            if fk_name not in fks:
+                fks[fk_name] = ForeignKeyInfo(
+                    name=fk_name,
+                    columns=[],
+                    ref_table=ref_table,
+                    ref_columns=[],
+                    on_update=on_update,
+                    on_delete=on_delete,
+                )
+            fks[fk_name].columns.append(col_name)
+            fks[fk_name].ref_columns.append(ref_col)
+        return fks
+
+    def _collect_partitions(self, table_name: str) -> List[PartitionInfo]:
+        sql = """
+            SELECT
+                child.relname AS partition_name,
+                pg_get_expr(child.relpartbound, child.oid) AS partition_bound,
+                parent.relkind AS parent_kind,
+                CASE
+                    WHEN parent.relkind = 'p' THEN 'declarative'
+                    ELSE 'inheritance'
+                END AS partition_method,
+                pg_get_partkeydef(parent.oid) AS partition_expr
+            FROM pg_catalog.pg_inherits pi
+            JOIN pg_catalog.pg_class child ON child.oid = pi.inhrelid
+            JOIN pg_catalog.pg_class parent ON parent.oid = pi.inhparent
+            JOIN pg_catalog.pg_namespace pn ON pn.oid = parent.relnamespace
+            WHERE pn.nspname = %s AND parent.relname = %s
+            ORDER BY child.relname
+        """
+        rows = self.db.execute(sql, (self.schema, table_name), fetch=True)
+        partitions = []
+        for r in rows:
+            partitions.append(PartitionInfo(
+                name=r[0] or '',
+                partition_type=r[3] or '',
+                partition_expression=r[4] or '',
+                parent_table=table_name,
+                partition_values=r[1] or '',
+            ))
+        return partitions
+
+    def _collect_triggers(self, table_name: str) -> Dict[str, TriggerInfo]:
+        sql = """
+            SELECT trigger_name, event_manipulation, action_timing,
+                   action_statement, action_orientation
+            FROM information_schema.triggers
+            WHERE trigger_schema = %s AND event_object_table = %s
+              AND trigger_name NOT LIKE 'pg_%'
+            ORDER BY trigger_name
+        """
+        rows = self.db.execute(sql, (self.schema, table_name), fetch=True)
+        triggers = {}
+        for r in rows:
+            triggers[r[0]] = TriggerInfo(
+                name=r[0],
+                event_manipulation=r[1] or '',
+                action_timing=r[2] or '',
+                action_statement=r[3] or '',
+                action_orientation=r[4] or '',
+            )
+        return triggers
 
 
 class MetadataCollector:

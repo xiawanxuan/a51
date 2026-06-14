@@ -126,6 +126,21 @@ class ConfigManager:
     def get_type_mapping(self, source_db_type: str) -> Dict[str, str]:
         return self.rules.get('rules', {}).get('type_mapping', {}).get(source_db_type, {})
 
+    def is_dependency_check_enabled(self) -> bool:
+        return self.rules.get('dependency_check', {}).get('enabled', True)
+
+    def is_dependency_check_blocking(self) -> bool:
+        return self.rules.get('dependency_check', {}).get('blocking', True)
+
+    def should_check_foreign_keys(self) -> bool:
+        return self.rules.get('dependency_check', {}).get('check_foreign_keys', True)
+
+    def should_check_partitions(self) -> bool:
+        return self.rules.get('dependency_check', {}).get('check_partitions', True)
+
+    def should_check_triggers(self) -> bool:
+        return self.rules.get('dependency_check', {}).get('check_triggers', True)
+
     def get_schedule_config(self) -> Dict[str, Any]:
         return self.rules.get('schedule', {})
 
